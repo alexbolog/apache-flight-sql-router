@@ -1,3 +1,3 @@
 fn main() {
-    println!("Hello, world!");
+    apache_flight_sql_router::run();
 }
