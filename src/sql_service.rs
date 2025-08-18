@@ -1,43 +1,28 @@
 use crate::auth::{create_jwt_token, verify_password};
 use crate::db_router::DbRouter;
 use crate::utils::flight_data_from_arrow_schema;
-use crate::{AuthContext, HandshakeCreds};
-use arrow::ipc::RecordBatch;
+use crate::{AuthContext, HandshakeCreds, RevocationList};
 use arrow::ipc::writer::{IpcDataGenerator, IpcWriteOptions};
-use arrow_array::ArrayRef;
 use arrow_flight::flight_service_server::FlightService;
 use arrow_flight::sql::metadata::{SqlInfoData, SqlInfoDataBuilder};
 use arrow_flight::sql::server::FlightSqlService;
 use arrow_flight::sql::server::{DoPutError, PeekableFlightDataStream};
-use arrow_flight::sql::{
-    ActionBeginSavepointRequest, ActionBeginSavepointResult, ActionBeginTransactionRequest,
-    ActionBeginTransactionResult, ActionCancelQueryRequest, ActionCancelQueryResult,
-    ActionClosePreparedStatementRequest, ActionCreatePreparedStatementRequest,
-    ActionCreatePreparedStatementResult, ActionCreatePreparedSubstraitPlanRequest,
-    ActionEndSavepointRequest, ActionEndTransactionRequest, Any, Command, CommandGetCatalogs,
-    CommandGetCrossReference, CommandGetDbSchemas, CommandGetExportedKeys, CommandGetImportedKeys,
-    CommandGetPrimaryKeys, CommandGetSqlInfo, CommandGetTableTypes, CommandGetTables,
-    CommandGetXdbcTypeInfo, CommandPreparedStatementQuery, CommandPreparedStatementUpdate,
-    CommandStatementIngest, CommandStatementQuery, CommandStatementSubstraitPlan,
-    CommandStatementUpdate, DoPutPreparedStatementResult, SqlInfo, TicketStatementQuery,
-};
-use arrow_flight::utils::{batches_to_flight_data, flight_data_to_arrow_batch};
+use arrow_flight::sql::*;
 use arrow_flight::{
     Action, ActionType, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest,
     HandshakeResponse, Ticket,
 };
 use arrow_ipc::writer::DictionaryTracker;
-use arrow_schema::{ArrowError, Schema, SchemaRef};
-use futures::{Stream, StreamExt, TryStreamExt, stream};
-use std::collections::HashMap;
+use arrow_schema::ArrowError;
+use futures::{Stream, StreamExt, TryStreamExt};
 use std::pin::Pin;
-use tonic::codegen::Bytes;
 use tonic::{Request, Response, Status, Streaming};
 
 #[derive(Clone)]
 pub struct SqlRouterService {
     pub issuer: String,
     pub audience: String,
+    pub revocations: RevocationList,
     router: DbRouter,
 }
 
@@ -46,6 +31,7 @@ impl SqlRouterService {
         Self {
             issuer,
             audience,
+            revocations: RevocationList::default(),
             router,
         }
     }
@@ -561,4 +547,140 @@ pub fn flight_data_from_arrow_batch(
         .into();
 
     Ok((main_fd, vec![ipc_dicts.into()]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::{Claims, HandshakeCreds, get_jwt_secret};
+    use arrow_flight::HandshakeRequest;
+    use arrow_flight::flight_service_client::FlightServiceClient;
+    use arrow_flight::flight_service_server::FlightServiceServer;
+    use futures::StreamExt;
+    use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+    use serde_json;
+    use std::net::SocketAddr;
+    use tokio::net::TcpListener;
+    use tokio::task::JoinHandle;
+    use tonic::codegen::Bytes;
+    use tonic::transport::Server;
+
+    pub fn create_test_service() -> SqlRouterService {
+        SqlRouterService::new(
+            "test-issuer".to_string(),
+            "test-audience".to_string(),
+            DbRouter::default(),
+        )
+    }
+
+    pub async fn start_test_server() -> (u16, JoinHandle<()>) {
+        // Bind to random free port
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let port = addr.port();
+
+        let svc = create_test_service();
+
+        // Spawn server task
+        let handle = tokio::spawn(async move {
+            Server::builder()
+                .add_service(FlightServiceServer::new(svc))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .expect("server crashed");
+        });
+
+        (port, handle)
+    }
+
+    #[tokio::test]
+    pub async fn test_successful_handshake() {
+        let (port, handle) = start_test_server().await;
+        let mut client = FlightServiceClient::connect(format!("http://127.0.0.1:{}", port))
+            .await
+            .expect("failed to connect to server");
+
+        // Create a request stream with one HandshakeRequest
+        let creds = HandshakeCreds {
+            username: "alice".into(),
+            password: "secret1".into(),
+        };
+        let payload = serde_json::to_vec(&creds).unwrap();
+
+        let req_stream = tokio_stream::iter(vec![HandshakeRequest {
+            protocol_version: 0,
+            payload: Bytes::from(payload),
+        }]);
+
+        let response = client
+            .handshake(tonic::Request::new(req_stream))
+            .await
+            .unwrap();
+        let mut stream = response.into_inner();
+        let resp = stream.next().await.unwrap().unwrap();
+        let token = String::from_utf8(resp.payload.to_vec()).unwrap();
+
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.set_audience(&["test-audience"]);
+        validation.set_issuer(&["test-issuer"]);
+
+        let decoded = decode::<Claims>(
+            &token,
+            &DecodingKey::from_secret(get_jwt_secret()),
+            &validation,
+        )
+        .expect("failed to decode JWT");
+
+        assert_eq!(decoded.claims.sub, "alice");
+        assert_eq!(decoded.claims.tid, "tenant_acme");
+        assert_eq!(decoded.claims.roles, vec!["reader", "analyst"]);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    pub async fn test_handshake_invalid_creds() {
+        let (port, handle) = start_test_server().await;
+        let mut client = FlightServiceClient::connect(format!("http://127.0.0.1:{}", port))
+            .await
+            .expect("failed to connect to server");
+
+        let creds = HandshakeCreds {
+            username: "alice".into(),
+            password: "wrong-password".into(),
+        };
+        let payload = serde_json::to_vec(&creds).unwrap();
+
+        let req_stream = tokio_stream::iter(vec![HandshakeRequest {
+            protocol_version: 0,
+            payload: Bytes::from(payload),
+        }]);
+
+        let result = client.handshake(tonic::Request::new(req_stream)).await;
+
+        // The server should reject this
+        assert!(result.is_err());
+
+        // Optionally check the gRPC status code
+        if let Err(status) = result {
+            assert_eq!(status.code(), tonic::Code::Unauthenticated);
+            assert!(status.message().contains("bad password"));
+        }
+
+        handle.abort();
+    }
+
+    #[test]
+    pub fn test_myflight_service_constructor() {
+        let service = SqlRouterService::new(
+            "test-issuer".to_string(),
+            "test-audience".to_string(),
+            DbRouter::default(),
+        );
+
+        assert_eq!(service.issuer, "test-issuer");
+        assert_eq!(service.audience, "test-audience");
+        // The revocation list should be empty initially
+        assert!(service.revocations.is_empty());
+    }
 }
