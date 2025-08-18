@@ -25,4 +25,5 @@ anyhow = "1.0.99"
 arrow-array = "56.0.0"
 arrow-schema = "56.0.0"
 deadpool-postgres = "0.14.1"
-tokio-postgres = "0.7.13"
+tokio-postgres = { version = "0.7.13", features = ["with-chrono-0_4"] }
+rust_decimal = "1.37.2"
