@@ -66,7 +66,7 @@ pub struct Claims {
     pub aud: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct AuthContext {
     pub user: String,
     pub tenant_id: String,

@@ -14,6 +14,16 @@ impl PostgresBackend {
         Self { pool }
     }
 
+    pub fn new_from_conn_string(conn_str: &str) -> Self {
+        let mgr = deadpool_postgres::Manager::new(conn_str.parse().unwrap(), tokio_postgres::NoTls);
+        let pool = deadpool_postgres::Pool::builder(mgr)
+            .max_size(4)
+            .build()
+            .unwrap();
+
+        Self::new(pool)
+    }
+
     // check if this mapping is actually needed or will be provided by flight-sql
     fn map_pg_type(ty: &Type) -> anyhow::Result<DataType> {
         Ok(match *ty {
@@ -147,4 +157,69 @@ fn decimal_string_to_i128_scaled(s: &str, scale: i32) -> anyhow::Result<i128> {
     let scale = rust_decimal::Decimal::new(1, scale as u32).normalize();
     let scaled = bd * scale;
     Ok(scaled.mantissa())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::db_backends::pg_backend::PostgresBackend;
+    use crate::{AuthContext, SqlBackend};
+    use arrow_array::StringArray;
+    use futures::StreamExt;
+    use testcontainers_modules::{postgres, testcontainers::runners::SyncRunner};
+
+    #[test]
+    fn test_postgres_backend() {
+        let container = postgres::Postgres::default().start().unwrap();
+        let host_port = container.get_host_port_ipv4(5432).unwrap();
+        let conn_str = &format!("postgres://postgres:postgres@127.0.0.1:{host_port}/postgres",);
+        let backend = PostgresBackend::new_from_conn_string(conn_str);
+
+        // Run async logic inside a tokio runtime manually
+        tokio_test::block_on(async {
+            let (client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
+                .await
+                .expect("Failed to connect");
+
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    eprintln!("Connection error: {}", e);
+                }
+            });
+
+            client
+                .execute(
+                    "CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT NOT NULL)",
+                    &[],
+                )
+                .await
+                .unwrap();
+
+            client
+                .execute("INSERT INTO users (name) VALUES ($1)", &[&"alice"])
+                .await
+                .unwrap();
+
+            let mut stream = backend
+                .query(
+                    "SELECT name FROM users WHERE name = \'alice\'",
+                    &AuthContext::default(),
+                )
+                .await
+                .expect("Failed to execute query");
+
+            // Take the first batch from the stream
+            let batch = stream.next().await.unwrap().unwrap();
+
+            // Access the "name" column (assuming it's the first column, index 0)
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("Column 0 should be StringArray");
+
+            // Row 0 should be "alice"
+            let name = col.value(0);
+            assert_eq!(name, "alice");
+        });
+    }
 }
