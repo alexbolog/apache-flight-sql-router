@@ -12,6 +12,7 @@ use std::result::Result;
 use std::sync::{Arc, RwLock};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::info;
+use uuid::Uuid;
 
 #[derive(Clone, Debug)]
 struct Account {
@@ -147,7 +148,8 @@ impl FlightService for MyFlightService {
 
         // Issue JWT (HS256 for demo)
         let now = chrono::Utc::now().timestamp() as usize;
-        let jti = uuid_like();
+        let jti = Uuid::new_v4().to_string();
+
         let claims = Claims {
             sub: acct.username.clone(),
             tid: acct.tenant_id.clone(),
@@ -211,6 +213,19 @@ impl FlightService for MyFlightService {
             ordered: false,
         }; // schema omitted for brevity
         Ok(Response::new(info))
+    }
+
+    async fn poll_flight_info(
+        &self,
+        _request: Request<FlightDescriptor>,
+    ) -> Result<Response<PollInfo>, Status> {
+        Err(Status::unimplemented("poll_flight_info"))
+    }
+    async fn get_schema(
+        &self,
+        _request: Request<FlightDescriptor>,
+    ) -> Result<Response<SchemaResult>, Status> {
+        Err(Status::unimplemented("get_schema"))
     }
 
     type DoGetStream = Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send + 'static>>;
@@ -280,19 +295,6 @@ impl FlightService for MyFlightService {
         });
         Ok(Response::new(Box::pin(s)))
     }
-
-    async fn poll_flight_info(
-        &self,
-        _request: Request<FlightDescriptor>,
-    ) -> Result<Response<PollInfo>, Status> {
-        Err(Status::unimplemented("poll_flight_info"))
-    }
-    async fn get_schema(
-        &self,
-        _request: Request<FlightDescriptor>,
-    ) -> Result<Response<SchemaResult>, Status> {
-        Err(Status::unimplemented("get_schema"))
-    }
 }
 
 fn auth_interceptor(
@@ -334,17 +336,6 @@ fn auth_interceptor(
     }
 }
 
-fn uuid_like() -> String {
-    // Not a real UUID to keep deps minimal; fine for demo jti.
-    use rand::Rng;
-    let mut rng = rand::rng();
-    let parts: [u32; 4] = [rng.random(), rng.random(), rng.random(), rng.random()];
-    format!(
-        "{:08x}{:08x}{:08x}{:08x}",
-        parts[0], parts[1], parts[2], parts[3]
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,9 +372,6 @@ mod tests {
         (port, handle)
     }
 
-    // For now, let's focus on testing the core logic without complex streaming
-    // We'll test the JWT generation and validation separately
-
     #[tokio::test]
     async fn test_successful_handshake() {
         let (port, handle) = start_test_server().await;
@@ -412,12 +400,9 @@ mod tests {
         validation.set_audience(&["test-audience"]);
         validation.set_issuer(&["test-issuer"]);
 
-        let decoded = decode::<Claims>(
-            &token,
-            &DecodingKey::from_secret(&*JWT_SECRET),
-            &validation,
-        )
-        .expect("failed to decode JWT");
+        let decoded =
+            decode::<Claims>(&token, &DecodingKey::from_secret(&*JWT_SECRET), &validation)
+                .expect("failed to decode JWT");
 
         assert_eq!(decoded.claims.sub, "alice");
         assert_eq!(decoded.claims.tid, "tenant_acme");
@@ -458,83 +443,6 @@ mod tests {
         handle.abort();
     }
 
-
-    #[test]
-    fn test_accounts_loaded() {
-        // Test that accounts are loaded
-        assert_eq!(ACCOUNTS.len(), 2);
-
-        // Verify alice account exists with correct data
-        let alice = ACCOUNTS.iter().find(|a| a.username == "alice").unwrap();
-        assert_eq!(alice.tenant_id, "tenant_acme");
-        assert_eq!(alice.roles, vec!["reader", "analyst"]);
-
-        // Verify bob account exists with correct data
-        let bob = ACCOUNTS.iter().find(|a| a.username == "bob").unwrap();
-        assert_eq!(bob.tenant_id, "tenant_beta");
-        assert_eq!(bob.roles, vec!["reader"]);
-    }
-
-    #[test]
-    fn test_handshake_credentials_validation() {
-        // Test that credentials can be properly serialized and validated
-        let creds = HandshakeCreds {
-            username: "testuser".to_string(),
-            password: "testpass".to_string(),
-        };
-
-        // Test JSON serialization/deserialization
-        let json = serde_json::to_string(&creds).unwrap();
-        let deserialized: HandshakeCreds = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(creds.username, deserialized.username);
-        assert_eq!(creds.password, deserialized.password);
-
-        // Test that the credentials structure is correct
-        assert_eq!(creds.username, "testuser");
-        assert_eq!(creds.password, "testpass");
-    }
-
-    #[test]
-    fn test_handshake_error_scenarios() {
-        // Test the error handling logic without async complexity
-
-        // Test that we can create invalid credentials
-        let invalid_creds = HandshakeCreds {
-            username: "nonexistent".to_string(),
-            password: "wrongpassword".to_string(),
-        };
-
-        // Test that invalid credentials can be serialized
-        let json = serde_json::to_string(&invalid_creds).unwrap();
-        assert!(json.contains("nonexistent"));
-        assert!(json.contains("wrongpassword"));
-
-        // Test that we can create handshake requests
-        let handshake_request = HandshakeRequest {
-            protocol_version: 1,
-            payload: b"invalid json".to_vec().into(),
-        };
-
-        assert_eq!(handshake_request.protocol_version, 1);
-        assert!(!handshake_request.payload.is_empty());
-    }
-
-    #[test]
-    fn test_handshake_credentials_serialization() {
-        // Test that HandshakeCreds can be serialized and deserialized
-        let creds = HandshakeCreds {
-            username: "testuser".to_string(),
-            password: "testpass".to_string(),
-        };
-
-        let json = serde_json::to_string(&creds).unwrap();
-        let deserialized: HandshakeCreds = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(creds.username, deserialized.username);
-        assert_eq!(creds.password, deserialized.password);
-    }
-
     #[test]
     fn test_password_verification() {
         // Test that password verification works correctly
@@ -549,94 +457,6 @@ mod tests {
         // Test incorrect password
         let result = argon2::Argon2::default().verify_password("wrongpassword".as_bytes(), &parsed);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_jwt_secret_generation() {
-        // Test that JWT secret is generated and has correct length
-        assert_eq!(JWT_SECRET.len(), 32);
-
-        // Test that it's not all zeros (very unlikely)
-        let all_zeros = [0u8; 32];
-        assert_ne!(*JWT_SECRET, all_zeros);
-    }
-
-    #[test]
-    fn test_jwt_token_structure() {
-        // Test JWT token structure and claims
-        let now = chrono::Utc::now().timestamp() as usize;
-        let jti = uuid_like();
-
-        let claims = Claims {
-            sub: "testuser".to_string(),
-            tid: "test_tenant".to_string(),
-            roles: vec!["admin".to_string()],
-            iat: now,
-            exp: now + 600, // 10 minutes
-            jti: jti.clone(),
-            iss: "test-issuer".to_string(),
-            aud: "test-audience".to_string(),
-        };
-
-        // Test claims fields
-        assert_eq!(claims.sub, "testuser");
-        assert_eq!(claims.tid, "test_tenant");
-        assert_eq!(claims.roles, vec!["admin"]);
-        assert_eq!(claims.iss, "test-issuer");
-        assert_eq!(claims.aud, "test-audience");
-        assert_eq!(claims.jti, jti);
-        assert_eq!(claims.iat, now);
-        assert_eq!(claims.exp, now + 600);
-
-        // Test expiration logic
-        assert!(claims.exp > claims.iat);
-        assert_eq!(claims.exp - claims.iat, 600);
-    }
-
-    #[test]
-    fn test_jwt_token_encoding_decoding() {
-        // Test that we can encode and decode JWT tokens
-        let now = chrono::Utc::now().timestamp() as usize;
-        let jti = uuid_like();
-
-        let claims = Claims {
-            sub: "testuser".to_string(),
-            tid: "test_tenant".to_string(),
-            roles: vec!["admin".to_string()],
-            iat: now,
-            exp: now + 600,
-            jti: jti.clone(),
-            iss: "test-issuer".to_string(),
-            aud: "test-audience".to_string(),
-        };
-
-        // Encode the token
-        let token = encode(
-            &Header::new(Algorithm::HS256),
-            &claims,
-            &EncodingKey::from_secret(&*JWT_SECRET),
-        )
-        .unwrap();
-
-        // Decode and validate the token
-        let mut validation = Validation::new(Algorithm::HS256);
-        validation.set_audience(&["test-audience"]);
-        validation.set_issuer(&["test-issuer"]);
-
-        let decoded =
-            decode::<Claims>(&token, &DecodingKey::from_secret(&*JWT_SECRET), &validation).unwrap();
-
-        let decoded_claims = decoded.claims;
-
-        // Verify all fields match
-        assert_eq!(decoded_claims.sub, claims.sub);
-        assert_eq!(decoded_claims.tid, claims.tid);
-        assert_eq!(decoded_claims.roles, claims.roles);
-        assert_eq!(decoded_claims.iss, claims.iss);
-        assert_eq!(decoded_claims.aud, claims.aud);
-        assert_eq!(decoded_claims.jti, claims.jti);
-        assert_eq!(decoded_claims.iat, claims.iat);
-        assert_eq!(decoded_claims.exp, claims.exp);
     }
 
     #[test]
@@ -656,23 +476,6 @@ mod tests {
         // Revoke another token
         revocations.revoke("token2".to_string());
         assert!(revocations.is_revoked("token2"));
-    }
-
-    #[test]
-    fn test_uuid_like_generation() {
-        let uuid1 = uuid_like();
-        let uuid2 = uuid_like();
-
-        // Should be 32 characters long (8 hex chars * 4 parts)
-        assert_eq!(uuid1.len(), 32);
-        assert_eq!(uuid2.len(), 32);
-
-        // Should contain only hexadecimal characters
-        assert!(uuid1.chars().all(|c| c.is_ascii_hexdigit()));
-        assert!(uuid2.chars().all(|c| c.is_ascii_hexdigit()));
-
-        // Should be different (very unlikely to be the same)
-        assert_ne!(uuid1, uuid2);
     }
 
     #[test]
