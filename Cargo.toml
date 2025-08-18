@@ -20,3 +20,7 @@ argon2 = "0.5.3"
 tokio = { version = "1.0", features = ["full", "test-util"] }
 tokio-stream = "0.1.17"
 uuid = { version = "1.18.0", features = ["v4"] }
+async-trait = "0.1.88"
+anyhow = "1.0.99"
+arrow-array = "56.0.0"
+arrow-schema = "56.0.0"
