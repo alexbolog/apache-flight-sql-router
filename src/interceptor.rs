@@ -1,5 +1,5 @@
 use crate::auth::{AuthContext, RevocationList, validate_jwt_token};
-use tonic::{Request, Status};
+use tonic::{GrpcMethod, Request, Status};
 
 pub fn auth_interceptor(
     revocations: RevocationList,
@@ -7,9 +7,18 @@ pub fn auth_interceptor(
     audience: String,
 ) -> impl Fn(Request<()>) -> std::result::Result<Request<()>, Status> + Clone {
     move |mut req: Request<()>| {
-        // For now, allow all requests through since we can't easily check the method
-        // In a real implementation, you'd want to check the gRPC method name
-        // This is a simplified version for demo purposes
+        let is_handshake = req
+            .extensions()
+            .get::<GrpcMethod>()
+            .map(|m| {
+                m.method() == "Handshake" && m.service() == "arrow.flight.protocol.FlightService"
+            })
+            .unwrap_or(false);
+
+        // Handshake: no token required
+        if is_handshake {
+            return Ok(req);
+        }
 
         let token = req
             .metadata()

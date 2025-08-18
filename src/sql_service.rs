@@ -1,6 +1,6 @@
 use crate::auth::{create_jwt_token, verify_password};
 use crate::db_router::DbRouter;
-use crate::utils::flight_data_from_arrow_schema;
+use crate::utils::{flight_data_from_arrow_batch, flight_data_from_arrow_schema};
 use crate::{AuthContext, HandshakeCreds, RevocationList};
 use arrow::ipc::writer::{IpcDataGenerator, IpcWriteOptions};
 use arrow_flight::flight_service_server::FlightService;
@@ -12,10 +12,9 @@ use arrow_flight::{
     Action, ActionType, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest,
     HandshakeResponse, Ticket,
 };
-use arrow_ipc::writer::DictionaryTracker;
-use arrow_schema::ArrowError;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt, stream};
 use std::pin::Pin;
+use tonic::codegen::Bytes;
 use tonic::{Request, Response, Status, Streaming};
 
 #[derive(Clone)]
@@ -42,6 +41,9 @@ type HandshakeStream =
 
 type DoGetStream =
     Pin<Box<dyn futures::Stream<Item = Result<arrow_flight::FlightData, tonic::Status>> + Send>>;
+
+type DoActionStream =
+    Pin<Box<dyn futures::Stream<Item = Result<arrow_flight::Result, Status>> + Send + 'static>>;
 
 #[tonic::async_trait]
 impl FlightSqlService for SqlRouterService {
@@ -77,18 +79,10 @@ impl FlightSqlService for SqlRouterService {
         Ok(Response::new(Box::pin(s)))
     }
 
-    async fn do_get_fallback(
-        &self,
-        _request: Request<Ticket>,
-        message: Any,
-    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        Err(Status::unimplemented("do_get_fallback not implemented"))
-    }
-
     async fn get_flight_info_statement(
         &self,
         query: CommandStatementQuery,
-        mut req: Request<FlightDescriptor>,
+        req: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
         let ctx = req
             .extensions()
@@ -127,6 +121,80 @@ impl FlightSqlService for SqlRouterService {
             ordered: false,
         };
         Ok(Response::new(info))
+    }
+
+    async fn do_get_statement(
+        &self,
+        _ticket: TicketStatementQuery,
+        req: Request<Ticket>,
+    ) -> Result<Response<DoGetStream>, Status> {
+        let ctx = req
+            .extensions()
+            .get::<AuthContext>()
+            .ok_or(Status::unauthenticated("no auth context"))?
+            .clone();
+
+        let (tenant_id, sql): (String, String) =
+            serde_json::from_slice(&req.get_ref().ticket).map_err(internal)?;
+
+        if tenant_id != ctx.tenant_id {
+            return Err(Status::permission_denied("tenant mismatch"));
+        }
+
+        let cfg = self
+            .router
+            .for_tenant(&tenant_id)
+            .map_err(|e| Status::permission_denied(e.to_string()))?;
+
+        let batches = cfg.backend.query(&sql, &ctx).await.map_err(internal)?;
+
+        let out = batches
+            .map(move |res| {
+                res.map_err(internal).and_then(|rb| {
+                    let (fd, dicts) = flight_data_from_arrow_batch(&rb).map_err(internal)?;
+                    let seq = dicts.into_iter().map(Ok).chain(std::iter::once(Ok(fd)));
+                    Ok::<_, Status>(futures::stream::iter(seq))
+                })
+            })
+            .try_flatten();
+
+        Ok(Response::new(Box::pin(out)))
+    }
+
+    async fn do_get_sql_info(
+        &self,
+        _query: CommandGetSqlInfo,
+        _request: Request<Ticket>,
+    ) -> Result<Response<DoGetStream>, Status> {
+        // Build the SqlInfoData (server metadata)
+        let mut b = SqlInfoDataBuilder::new();
+        b.append(SqlInfo::FlightSqlServerName, "demo-sql-router");
+        b.append(SqlInfo::FlightSqlServerVersion, "0.1.0");
+        let sql_info_data: SqlInfoData = b.build().map_err(|e| Status::internal(e.to_string()))?;
+
+        // TODO: impl actual record fetching
+        // get the RecordBatch to send (empty Vec -> return all)
+        let batch = sql_info_data
+            .record_batch(Vec::<u32>::new())
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        // schema for encoding
+        let schema_ref = sql_info_data.schema();
+        // encode to FlightData sequence
+        let flights = crate::utils::batches_to_flight_data(schema_ref.as_ref(), vec![batch])
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        // stream them as tonic Response<Stream>
+        let s = futures::stream::iter(flights.into_iter().map(Ok));
+        Ok(Response::new(Box::pin(s) as DoGetStream))
+    }
+
+    async fn do_get_fallback(
+        &self,
+        _request: Request<Ticket>,
+        message: Any,
+    ) -> Result<Response<DoGetStream>, Status> {
+        Err(Status::unimplemented("do_get_fallback not implemented"))
     }
 
     async fn get_flight_info_substrait_plan(
@@ -233,52 +301,11 @@ impl FlightSqlService for SqlRouterService {
         Err(Status::unimplemented("do_get_fallback not implemented"))
     }
 
-    async fn do_get_statement(
-        &self,
-        _ticket: TicketStatementQuery,
-        req: Request<Ticket>,
-    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        let ctx = req
-            .extensions()
-            .get::<AuthContext>()
-            .ok_or(Status::unauthenticated("no auth context"))?
-            .clone();
-
-        let (tenant_id, sql): (String, String) =
-            serde_json::from_slice(&req.get_ref().ticket).map_err(internal)?;
-
-        if tenant_id != ctx.tenant_id {
-            return Err(Status::permission_denied("tenant mismatch"));
-        }
-
-        let cfg = self
-            .router
-            .for_tenant(&tenant_id)
-            .map_err(|e| Status::permission_denied(e.to_string()))?;
-
-        let batches = cfg.backend.query(&sql, &ctx).await.map_err(internal)?;
-
-        let mut dict_tracker = DictionaryTracker::new(false);
-        let write_opts = IpcWriteOptions::default();
-
-        let out = batches
-            .map(move |res| {
-                res.map_err(internal).and_then(|rb| {
-                    let (fd, dicts) = flight_data_from_arrow_batch(&rb).map_err(internal)?;
-                    let seq = dicts.into_iter().map(Ok).chain(std::iter::once(Ok(fd)));
-                    Ok::<_, Status>(futures::stream::iter(seq))
-                })
-            })
-            .try_flatten();
-
-        Ok(Response::new(Box::pin(out)))
-    }
-
     async fn do_get_prepared_statement(
         &self,
         _query: CommandPreparedStatementQuery,
         _request: Request<Ticket>,
-    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+    ) -> Result<Response<DoGetStream>, Status> {
         Err(Status::unimplemented("do_get_fallback not implemented"))
     }
 
@@ -286,7 +313,7 @@ impl FlightSqlService for SqlRouterService {
         &self,
         _query: CommandGetCatalogs,
         _request: Request<Ticket>,
-    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+    ) -> Result<Response<DoGetStream>, Status> {
         Err(Status::unimplemented("do_get_fallback not implemented"))
     }
 
@@ -294,7 +321,7 @@ impl FlightSqlService for SqlRouterService {
         &self,
         _query: CommandGetDbSchemas,
         _request: Request<Ticket>,
-    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+    ) -> Result<Response<DoGetStream>, Status> {
         Err(Status::unimplemented("do_get_fallback not implemented"))
     }
 
@@ -302,7 +329,7 @@ impl FlightSqlService for SqlRouterService {
         &self,
         _query: CommandGetTables,
         _request: Request<Ticket>,
-    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+    ) -> Result<Response<DoGetStream>, Status> {
         Err(Status::unimplemented("do_get_fallback not implemented"))
     }
 
@@ -310,43 +337,15 @@ impl FlightSqlService for SqlRouterService {
         &self,
         _query: CommandGetTableTypes,
         _request: Request<Ticket>,
-    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        Err(Status::unimplemented("do_get_fallback not implemented"))
-    }
-
-    async fn do_get_sql_info(
-        &self,
-        _query: CommandGetSqlInfo,
-        _request: Request<Ticket>,
     ) -> Result<Response<DoGetStream>, Status> {
-        // Build the SqlInfoData (server metadata)
-        let mut b = SqlInfoDataBuilder::new();
-        b.append(SqlInfo::FlightSqlServerName, "demo-sql-router");
-        b.append(SqlInfo::FlightSqlServerVersion, "0.1.0");
-        let sql_info_data: SqlInfoData = b.build().map_err(|e| Status::internal(e.to_string()))?;
-
-        // TODO: impl actual record fetching
-        // get the RecordBatch to send (empty Vec -> return all)
-        let batch = sql_info_data
-            .record_batch(Vec::<u32>::new())
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        // schema for encoding
-        let schema_ref = sql_info_data.schema();
-        // encode to FlightData sequence
-        let flights = crate::utils::batches_to_flight_data(schema_ref.as_ref(), vec![batch])
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        // stream them as tonic Response<Stream>
-        let s = futures::stream::iter(flights.into_iter().map(Ok));
-        Ok(Response::new(Box::pin(s) as DoGetStream))
+        Err(Status::unimplemented("do_get_fallback not implemented"))
     }
 
     async fn do_get_primary_keys(
         &self,
         _query: CommandGetPrimaryKeys,
         _request: Request<Ticket>,
-    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+    ) -> Result<Response<DoGetStream>, Status> {
         Err(Status::unimplemented("do_get_fallback not implemented"))
     }
 
@@ -354,7 +353,7 @@ impl FlightSqlService for SqlRouterService {
         &self,
         _query: CommandGetExportedKeys,
         _request: Request<Ticket>,
-    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+    ) -> Result<Response<DoGetStream>, Status> {
         Err(Status::unimplemented("do_get_fallback not implemented"))
     }
 
@@ -362,7 +361,7 @@ impl FlightSqlService for SqlRouterService {
         &self,
         _query: CommandGetImportedKeys,
         _request: Request<Ticket>,
-    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+    ) -> Result<Response<DoGetStream>, Status> {
         Err(Status::unimplemented("do_get_fallback not implemented"))
     }
 
@@ -370,7 +369,7 @@ impl FlightSqlService for SqlRouterService {
         &self,
         _query: CommandGetCrossReference,
         _request: Request<Ticket>,
-    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+    ) -> Result<Response<DoGetStream>, Status> {
         Err(Status::unimplemented("do_get_fallback not implemented"))
     }
 
@@ -378,7 +377,7 @@ impl FlightSqlService for SqlRouterService {
         &self,
         _query: CommandGetXdbcTypeInfo,
         _request: Request<Ticket>,
-    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+    ) -> Result<Response<DoGetStream>, Status> {
         Err(Status::unimplemented("do_get_fallback not implemented"))
     }
 
@@ -442,12 +441,31 @@ impl FlightSqlService for SqlRouterService {
         &self,
         request: Request<Action>,
     ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
-        Err(Status::unimplemented("do_get_fallback not implemented"))
+        let ctx = request
+            .extensions()
+            .get::<AuthContext>()
+            .ok_or(Status::unauthenticated("no auth context"))?
+            .clone();
+
+        let action = request.into_inner();
+        match action.r#type.as_str() {
+            "revoke_self" => {
+                self.revocations.revoke(ctx.jti.clone());
+                let out = arrow_flight::Result {
+                    body: Bytes::from_static(b"revoked"),
+                };
+                Ok(Response::new(Box::pin(stream::once(async { Ok(out) }))))
+            }
+            other => Err(Status::unimplemented(format!("unknown action: {other}"))),
+        }
     }
 
+    #[allow(clippy::unused_async)]
     async fn list_custom_actions(&self) -> Option<Vec<Result<ActionType, Status>>> {
-        // Err(Status::unimplemented("do_get_fallback not implemented"))
-        None
+        Some(vec![Ok(ActionType {
+            r#type: "revoke_self".into(),
+            description: "Revoke the current JWT (by jti)".into(),
+        })])
     }
 
     async fn do_action_create_prepared_statement(
@@ -528,25 +546,6 @@ impl FlightSqlService for SqlRouterService {
 
 fn internal<E: std::fmt::Display>(e: E) -> Status {
     Status::internal(e.to_string())
-}
-
-pub fn flight_data_from_arrow_batch(
-    batch: &arrow_array::RecordBatch,
-) -> Result<(FlightData, Vec<FlightData>), ArrowError> {
-    let options = IpcWriteOptions::default();
-    let data_gen = IpcDataGenerator::default();
-    let mut dict_tracker = DictionaryTracker::new(false);
-
-    let (ipc_batch, ipc_dicts) = data_gen.encoded_batch(batch, &mut dict_tracker, &options)?;
-
-    // Should only be one main batch here
-    let main_fd = ipc_batch
-        .into_iter()
-        .next()
-        .expect("expected at least one encoded batch")
-        .into();
-
-    Ok((main_fd, vec![ipc_dicts.into()]))
 }
 
 #[cfg(test)]
@@ -671,7 +670,7 @@ mod tests {
     }
 
     #[test]
-    pub fn test_myflight_service_constructor() {
+    pub fn test_sql_flight_service_constructor() {
         let service = SqlRouterService::new(
             "test-issuer".to_string(),
             "test-audience".to_string(),

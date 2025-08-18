@@ -13,19 +13,18 @@ pub fn flight_data_from_arrow_schema(schema: &SchemaRef) -> Result<FlightData, A
     let data_gen = IpcDataGenerator::default();
 
     // returns EncodedData (ipc_message + optional arrow bytes)
-    let encoded: EncodedData = data_gen.schema_to_bytes_with_dictionary_tracker(
-        schema.as_ref(),
-        &mut tracker,
-        &options,
-    );
+    let encoded: EncodedData =
+        data_gen.schema_to_bytes_with_dictionary_tracker(schema.as_ref(), &mut tracker, &options);
 
     // FlightData implements From<EncodedData>
     Ok(FlightData::from(encoded))
 }
 
-/// Convert a single `RecordBatch` into a Vec<FlightData>
-/// (zero or more dictionary FlightData followed by one batch FlightData).
-pub fn flight_data_from_arrow_batch(batch: &RecordBatch) -> Result<Vec<FlightData>, ArrowError> {
+/// Encode one RecordBatch to Flight IPC: returns (main batch, dictionary batches).
+/// Send dicts first, then the main batch.
+pub fn flight_data_from_arrow_batch(
+    batch: &RecordBatch,
+) -> Result<(FlightData, Vec<FlightData>), ArrowError> {
     let options = IpcWriteOptions::default();
     let mut tracker = DictionaryTracker::new(false);
     let data_gen = IpcDataGenerator::default();
@@ -33,11 +32,10 @@ pub fn flight_data_from_arrow_batch(batch: &RecordBatch) -> Result<Vec<FlightDat
     // returns (Vec<EncodedData> dictionaries, EncodedData main_batch)
     let (dicts, main) = data_gen.encoded_batch(batch, &mut tracker, &options)?;
 
-    // convert EncodedData -> FlightData (From impl)
-    let mut out = Vec::with_capacity(dicts.len() + 1);
-    out.extend(dicts.into_iter().map(FlightData::from));
-    out.push(FlightData::from(main));
-    Ok(out)
+    Ok((
+        FlightData::from(main),
+        dicts.into_iter().map(FlightData::from).collect(),
+    ))
 }
 
 /// Build FlightData sequence for a schema + list of RecordBatches.
@@ -53,7 +51,9 @@ pub fn batches_to_flight_data(
 
     // Each RecordBatch -> possibly multiple FlightData (dicts + batch)
     for batch in batches {
-        let mut parts = flight_data_from_arrow_batch(&batch)?;
+        let (main_fd, mut parts) = flight_data_from_arrow_batch(&batch)?;
+        parts.push(main_fd);
+
         out.append(&mut parts);
     }
 
