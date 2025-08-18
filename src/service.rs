@@ -9,13 +9,13 @@ use tracing::info;
 
 use crate::auth::{AuthContext, HandshakeCreds, RevocationList, create_jwt_token, verify_password};
 
-pub struct MyFlightService {
+pub struct DmFlightService {
     pub issuer: String,
     pub audience: String,
     pub revocations: RevocationList,
 }
 
-impl MyFlightService {
+impl DmFlightService {
     pub fn new(issuer: String, audience: String) -> Self {
         Self {
             issuer,
@@ -26,7 +26,7 @@ impl MyFlightService {
 }
 
 #[tonic::async_trait]
-impl FlightService for MyFlightService {
+impl FlightService for DmFlightService {
     type HandshakeStream =
         Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send + 'static>>;
 
@@ -199,8 +199,8 @@ mod tests {
     use tonic::codegen::Bytes;
     use tonic::transport::Server;
 
-    pub fn create_test_service() -> MyFlightService {
-        MyFlightService::new("test-issuer".to_string(), "test-audience".to_string())
+    pub fn create_test_service() -> DmFlightService {
+        DmFlightService::new("test-issuer".to_string(), "test-audience".to_string())
     }
 
     pub async fn start_test_server() -> (u16, JoinHandle<()>) {
@@ -302,7 +302,7 @@ mod tests {
 
     #[test]
     pub fn test_myflight_service_constructor() {
-        let service = MyFlightService::new("test-issuer".to_string(), "test-audience".to_string());
+        let service = DmFlightService::new("test-issuer".to_string(), "test-audience".to_string());
 
         assert_eq!(service.issuer, "test-issuer");
         assert_eq!(service.audience, "test-audience");

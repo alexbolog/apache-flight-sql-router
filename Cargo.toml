@@ -29,6 +29,7 @@ tokio-postgres = { version = "0.7.13", features = ["with-chrono-0_4"] }
 rust_decimal = "1.37.2"
 testcontainers-modules = { version = "0.12.1", features = ["postgres", "blocking"] }
 tokio-test = "0.4.4"
+arrow-ipc = "56.0.0"
 
 [dev-dependencies]
 testcontainers = "^0.24.0"

@@ -81,6 +81,7 @@ dependencies = [
  "arrow",
  "arrow-array",
  "arrow-flight",
+ "arrow-ipc",
  "arrow-schema",
  "async-trait",
  "chrono",
