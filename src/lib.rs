@@ -1,7 +1,14 @@
-use crate::flight_server::MyFlightService;
 use arrow_flight::flight_service_server::FlightServiceServer;
 
-mod flight_server;
+pub mod auth;
+pub mod interceptor;
+pub mod service;
+pub mod types;
+
+// Re-export commonly used items for convenience
+pub use auth::{Account, AuthContext, Claims, HandshakeCreds, RevocationList};
+pub use service::MyFlightService;
+pub use types::{BatchStream, SqlBackend};
 
 pub fn run() {
     println!("Hello, world!");
@@ -16,5 +23,3 @@ pub fn run() {
     //     .execute()
     //     .get_arrow();
 }
-
-

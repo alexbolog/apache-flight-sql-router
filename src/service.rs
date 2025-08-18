@@ -1,108 +1,18 @@
-use argon2::PasswordHasher;
 use arrow_flight::flight_service_server::FlightService;
 use arrow_flight::*;
 use futures::{Stream, StreamExt};
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
-use once_cell::sync::Lazy;
-use rand::RngCore;
-use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use serde_json;
 use std::pin::Pin;
 use std::result::Result;
-use std::sync::{Arc, RwLock};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::info;
-use uuid::Uuid;
 
-#[derive(Clone, Debug)]
-struct Account {
-    username: String,
-    // Argon2 hash of password
-    pwd_hash: String,
-    tenant_id: String,
-    roles: Vec<String>,
-}
-
-static ACCOUNTS: Lazy<Vec<Account>> = Lazy::new(|| {
-    // Passwords: "secret1", "secret2" (hashed with argon2)
-    // Use a fixed salt for demo purposes to avoid rand version conflicts
-    let salt = argon2::password_hash::SaltString::from_b64("dGVzdHNhbHQ").unwrap(); // "testsalt" in base64 (without padding)
-
-    let hash1 = argon2::Argon2::default()
-        .hash_password("secret1".as_bytes(), &salt)
-        .unwrap()
-        .to_string();
-    let hash2 = argon2::Argon2::default()
-        .hash_password("secret2".as_bytes(), &salt)
-        .unwrap()
-        .to_string();
-
-    vec![
-        Account {
-            username: "alice".into(),
-            pwd_hash: hash1,
-            tenant_id: "tenant_acme".into(),
-            roles: vec!["reader".into(), "analyst".into()],
-        },
-        Account {
-            username: "bob".into(),
-            pwd_hash: hash2,
-            tenant_id: "tenant_beta".into(),
-            roles: vec!["reader".into()],
-        },
-    ]
-});
-
-// Hardcoded symmetric key (HS256) for demo. In production prefer EdDSA/RS256.
-static JWT_SECRET: Lazy<[u8; 32]> = Lazy::new(|| {
-    // For demo we generate at boot; for real deployments, inject via env/secret store and rotate.
-    let mut key = [0u8; 32];
-    rand::rng().fill_bytes(&mut key);
-    key
-});
-
-#[derive(Debug, Serialize, Deserialize)]
-struct Claims {
-    sub: String, // username or user id
-    tid: String, // tenant id
-    roles: Vec<String>,
-    exp: usize,
-    iat: usize,
-    jti: String,
-    iss: String,
-    aud: String,
-}
-
-#[derive(Clone, Debug)]
-struct AuthContext {
-    user: String,
-    tenant_id: String,
-    roles: Vec<String>,
-    jti: String,
-}
-
-// In-memory denylist for token revocation (opaque-like control for demo)
-#[derive(Default, Clone)]
-struct RevocationList(Arc<RwLock<HashSet<String>>>);
-impl RevocationList {
-    fn revoke(&self, jti: String) {
-        self.0.write().unwrap().insert(jti);
-    }
-    fn is_revoked(&self, jti: &str) -> bool {
-        self.0.read().unwrap().contains(jti)
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct HandshakeCreds {
-    username: String,
-    password: String,
-}
+use crate::auth::{AuthContext, HandshakeCreds, RevocationList, create_jwt_token, verify_password};
 
 pub struct MyFlightService {
-    issuer: String,
-    audience: String,
-    revocations: RevocationList,
+    pub issuer: String,
+    pub audience: String,
+    pub revocations: RevocationList,
 }
 
 impl MyFlightService {
@@ -114,25 +24,6 @@ impl MyFlightService {
         }
     }
 }
-
-use async_trait::async_trait;
-use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
-
-pub type BatchStream =
-Pin<Box<dyn Stream<Item = anyhow::Result<RecordBatch>> + Send + 'static>>;
-
-#[async_trait]
-pub trait SqlBackend: Send + Sync {
-    fn name(&self) -> &'static str;
-
-    /// Discover the Arrow schema for a SQL statement.
-    async fn schema(&self, sql: &str, ctx: &AuthContext) -> anyhow::Result<SchemaRef>;
-
-    /// Execute and stream Arrow record batches.
-    async fn query(&self, sql: &str, ctx: &AuthContext) -> anyhow::Result<BatchStream>;
-}
-
 
 #[tonic::async_trait]
 impl FlightService for MyFlightService {
@@ -154,37 +45,12 @@ impl FlightService for MyFlightService {
             .map_err(|_| Status::unauthenticated("invalid credentials payload"))?;
 
         // Verify against hardcoded accounts (argon2)
-        let acct = ACCOUNTS
-            .iter()
-            .find(|a| a.username == creds.username)
-            .ok_or_else(|| Status::unauthenticated("unknown user"))?;
-
-        use argon2::password_hash::{PasswordHash, PasswordVerifier};
-        let parsed = PasswordHash::new(&acct.pwd_hash).map_err(|_| Status::internal("bad hash"))?;
-        argon2::Argon2::default()
-            .verify_password(creds.password.as_bytes(), &parsed)
-            .map_err(|_| Status::unauthenticated("bad password"))?;
+        let acct = verify_password(&creds.username, &creds.password)
+            .map_err(|e| Status::unauthenticated(e))?;
 
         // Issue JWT (HS256 for demo)
-        let now = chrono::Utc::now().timestamp() as usize;
-        let jti = Uuid::new_v4().to_string();
-
-        let claims = Claims {
-            sub: acct.username.clone(),
-            tid: acct.tenant_id.clone(),
-            roles: acct.roles.clone(),
-            iat: now,
-            exp: now + 10 * 60, // 10 minutes
-            jti: jti.clone(),
-            iss: self.issuer.clone(),
-            aud: self.audience.clone(),
-        };
-        let token = encode(
-            &Header::new(Algorithm::HS256),
-            &claims,
-            &EncodingKey::from_secret(&*JWT_SECRET),
-        )
-        .map_err(|e| Status::internal(format!("token encode: {e}")))?;
+        let token = create_jwt_token(&acct, &self.issuer, &self.audience)
+            .map_err(|e| Status::internal(format!("token encode: {e}")))?;
 
         let resp = HandshakeResponse {
             protocol_version: first.protocol_version,
@@ -240,6 +106,7 @@ impl FlightService for MyFlightService {
     ) -> Result<Response<PollInfo>, Status> {
         Err(Status::unimplemented("poll_flight_info"))
     }
+
     async fn get_schema(
         &self,
         _request: Request<FlightDescriptor>,
@@ -316,50 +183,15 @@ impl FlightService for MyFlightService {
     }
 }
 
-fn auth_interceptor(
-    revocations: RevocationList,
-    issuer: String,
-    audience: String,
-) -> impl Fn(Request<()>) -> std::result::Result<Request<()>, Status> + Clone {
-    move |mut req: Request<()>| {
-        // For now, allow all requests through since we can't easily check the method
-        // In a real implementation, you'd want to check the gRPC method name
-        // This is a simplified version for demo purposes
-
-        let token = req
-            .metadata()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer "))
-            .ok_or_else(|| Status::unauthenticated("missing bearer token"))?;
-
-        let mut validation = Validation::new(Algorithm::HS256);
-        validation.set_audience(&[audience.as_str()]);
-        validation.set_issuer(&[issuer.as_str()]);
-
-        let data = decode::<Claims>(token, &DecodingKey::from_secret(&*JWT_SECRET), &validation)
-            .map_err(|e| Status::unauthenticated(format!("invalid token: {e}")))?;
-
-        if revocations.is_revoked(&data.claims.jti) {
-            return Err(Status::unauthenticated("token revoked"));
-        }
-
-        let ctx = AuthContext {
-            user: data.claims.sub,
-            tenant_id: data.claims.tid,
-            roles: data.claims.roles,
-            jti: data.claims.jti,
-        };
-        req.extensions_mut().insert(ctx);
-        Ok(req)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::{Claims, HandshakeCreds, get_jwt_secret};
+    use arrow_flight::HandshakeRequest;
     use arrow_flight::flight_service_client::FlightServiceClient;
     use arrow_flight::flight_service_server::FlightServiceServer;
+    use futures::StreamExt;
+    use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
     use serde_json;
     use std::net::SocketAddr;
     use tokio::net::TcpListener;
@@ -367,7 +199,7 @@ mod tests {
     use tonic::codegen::Bytes;
     use tonic::transport::Server;
 
-    fn create_test_service() -> MyFlightService {
+    pub fn create_test_service() -> MyFlightService {
         MyFlightService::new("test-issuer".to_string(), "test-audience".to_string())
     }
 
@@ -392,7 +224,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_successful_handshake() {
+    pub async fn test_successful_handshake() {
         let (port, handle) = start_test_server().await;
         let mut client = FlightServiceClient::connect(format!("http://127.0.0.1:{}", port))
             .await
@@ -410,7 +242,10 @@ mod tests {
             payload: Bytes::from(payload),
         }]);
 
-        let response = client.handshake(Request::new(req_stream)).await.unwrap();
+        let response = client
+            .handshake(tonic::Request::new(req_stream))
+            .await
+            .unwrap();
         let mut stream = response.into_inner();
         let resp = stream.next().await.unwrap().unwrap();
         let token = String::from_utf8(resp.payload.to_vec()).unwrap();
@@ -419,9 +254,12 @@ mod tests {
         validation.set_audience(&["test-audience"]);
         validation.set_issuer(&["test-issuer"]);
 
-        let decoded =
-            decode::<Claims>(&token, &DecodingKey::from_secret(&*JWT_SECRET), &validation)
-                .expect("failed to decode JWT");
+        let decoded = decode::<Claims>(
+            &token,
+            &DecodingKey::from_secret(get_jwt_secret()),
+            &validation,
+        )
+        .expect("failed to decode JWT");
 
         assert_eq!(decoded.claims.sub, "alice");
         assert_eq!(decoded.claims.tid, "tenant_acme");
@@ -431,7 +269,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handshake_invalid_creds() {
+    pub async fn test_handshake_invalid_creds() {
         let (port, handle) = start_test_server().await;
         let mut client = FlightServiceClient::connect(format!("http://127.0.0.1:{}", port))
             .await
@@ -448,7 +286,7 @@ mod tests {
             payload: Bytes::from(payload),
         }]);
 
-        let result = client.handshake(Request::new(req_stream)).await;
+        let result = client.handshake(tonic::Request::new(req_stream)).await;
 
         // The server should reject this
         assert!(result.is_err());
@@ -463,47 +301,12 @@ mod tests {
     }
 
     #[test]
-    fn test_password_verification() {
-        // Test that password verification works correctly
-        let alice = ACCOUNTS.iter().find(|a| a.username == "alice").unwrap();
-
-        // Test correct password
-        use argon2::password_hash::{PasswordHash, PasswordVerifier};
-        let parsed = PasswordHash::new(&alice.pwd_hash).unwrap();
-        let result = argon2::Argon2::default().verify_password("secret1".as_bytes(), &parsed);
-        assert!(result.is_ok());
-
-        // Test incorrect password
-        let result = argon2::Argon2::default().verify_password("wrongpassword".as_bytes(), &parsed);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_revocation_list() {
-        let revocations = RevocationList::default();
-
-        // Initially no tokens are revoked
-        assert!(!revocations.is_revoked("token1"));
-
-        // Revoke a token
-        revocations.revoke("token1".to_string());
-        assert!(revocations.is_revoked("token1"));
-
-        // Other tokens are still not revoked
-        assert!(!revocations.is_revoked("token2"));
-
-        // Revoke another token
-        revocations.revoke("token2".to_string());
-        assert!(revocations.is_revoked("token2"));
-    }
-
-    #[test]
-    fn test_myflight_service_constructor() {
+    pub fn test_myflight_service_constructor() {
         let service = MyFlightService::new("test-issuer".to_string(), "test-audience".to_string());
 
         assert_eq!(service.issuer, "test-issuer");
         assert_eq!(service.audience, "test-audience");
         // The revocation list should be empty initially
-        assert!(service.revocations.0.read().unwrap().is_empty());
+        assert!(service.revocations.is_empty());
     }
 }
