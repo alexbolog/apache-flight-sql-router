@@ -33,8 +33,8 @@ pub fn flight_data_from_arrow_batch(
     let (dicts, main) = data_gen.encoded_batch(batch, &mut tracker, &options)?;
 
     Ok((
-        FlightData::from(main),
-        dicts.into_iter().map(FlightData::from).collect(),
+        FlightData::from(main),                            // main first in tuple
+        dicts.into_iter().map(FlightData::from).collect(), // dicts vec second
     ))
 }
 

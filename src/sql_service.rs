@@ -2,7 +2,6 @@ use crate::auth::{create_jwt_token, verify_password};
 use crate::db_router::DbRouter;
 use crate::utils::{flight_data_from_arrow_batch, flight_data_from_arrow_schema};
 use crate::{AuthContext, HandshakeCreds, RevocationList};
-use arrow::ipc::writer::{IpcDataGenerator, IpcWriteOptions};
 use arrow_flight::flight_service_server::FlightService;
 use arrow_flight::sql::metadata::{SqlInfoData, SqlInfoDataBuilder};
 use arrow_flight::sql::server::FlightSqlService;
@@ -12,8 +11,10 @@ use arrow_flight::{
     Action, ActionType, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest,
     HandshakeResponse, Ticket,
 };
-use futures::{Stream, StreamExt, TryStreamExt, stream};
+use futures::{Stream, StreamExt, stream};
+use prost::Message;
 use std::pin::Pin;
+use std::sync::Arc;
 use tonic::codegen::Bytes;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -21,7 +22,7 @@ use tonic::{Request, Response, Status, Streaming};
 pub struct SqlRouterService {
     pub issuer: String,
     pub audience: String,
-    pub revocations: RevocationList,
+    pub revocations: Arc<RevocationList>,
     router: DbRouter,
 }
 
@@ -30,7 +31,7 @@ impl SqlRouterService {
         Self {
             issuer,
             audience,
-            revocations: RevocationList::default(),
+            revocations: Arc::new(RevocationList::default()),
             router,
         }
     }
@@ -59,7 +60,7 @@ impl FlightSqlService for SqlRouterService {
             .await
             .ok_or_else(|| Status::invalid_argument("empty handshake"))??;
 
-        // Expect JSON creds in payload
+        // Expect  creds in payload
         let creds: HandshakeCreds = serde_json::from_slice(&first.payload)
             .map_err(|_| Status::unauthenticated("invalid credentials payload"))?;
 
@@ -89,35 +90,38 @@ impl FlightSqlService for SqlRouterService {
             .get::<AuthContext>()
             .ok_or(Status::unauthenticated("no auth context"))?
             .clone();
-        let sql = query.query.clone();
 
+        let sql = query.query.clone();
         let cfg = self
             .router
             .for_tenant(&ctx.tenant_id)
             .map_err(|e| Status::permission_denied(e.to_string()))?;
 
         let schema = cfg.backend.schema(&sql, &ctx).await.map_err(internal)?;
-
         let schema_fd = flight_data_from_arrow_schema(&schema).map_err(internal)?;
 
-        // Pack a ticket (tenant + sql) so DoGet can execute it
-        let ticket_bytes = serde_json::to_vec(&(ctx.tenant_id.clone(), sql)).unwrap();
+        let handle = serde_json::to_vec(&(ctx.tenant_id.clone(), sql)).unwrap();
+        let ticket_msg = TicketStatementQuery {
+            statement_handle: handle.into(),
+        };
+
+        let mut buf = Vec::with_capacity(ticket_msg.encoded_len());
+        ticket_msg.encode(&mut buf).unwrap();
+
         let endpoint = FlightEndpoint {
-            ticket: Some(Ticket {
-                ticket: ticket_bytes.into(),
-            }),
+            ticket: Some(Ticket { ticket: buf.into() }),
             location: vec![],
-            app_metadata: vec![].into(),
+            app_metadata: Bytes::new(),
             expiration_time: None,
         };
 
         let info = FlightInfo {
-            schema: schema_fd.data_header,
+            schema: schema_fd.data_header, // IPC schema bytes
             flight_descriptor: None,
             endpoint: vec![endpoint],
             total_records: -1,
             total_bytes: -1,
-            app_metadata: vec![].into(),
+            app_metadata: Bytes::new(),
             ordered: false,
         };
         Ok(Response::new(info))
@@ -125,7 +129,7 @@ impl FlightSqlService for SqlRouterService {
 
     async fn do_get_statement(
         &self,
-        _ticket: TicketStatementQuery,
+        ticket: TicketStatementQuery,
         req: Request<Ticket>,
     ) -> Result<Response<DoGetStream>, Status> {
         let ctx = req
@@ -134,8 +138,10 @@ impl FlightSqlService for SqlRouterService {
             .ok_or(Status::unauthenticated("no auth context"))?
             .clone();
 
+        // Our handle is JSON (tenant_id, sql); decode it here
         let (tenant_id, sql): (String, String) =
-            serde_json::from_slice(&req.get_ref().ticket).map_err(internal)?;
+            serde_json::from_slice(&ticket.statement_handle)
+                .map_err(|e| Status::invalid_argument(format!("bad ticket: {e}")))?;
 
         if tenant_id != ctx.tenant_id {
             return Err(Status::permission_denied("tenant mismatch"));
@@ -146,19 +152,26 @@ impl FlightSqlService for SqlRouterService {
             .for_tenant(&tenant_id)
             .map_err(|e| Status::permission_denied(e.to_string()))?;
 
-        let batches = cfg.backend.query(&sql, &ctx).await.map_err(internal)?;
+        // Always send schema first
+        let schema_ref = cfg.backend.schema(&sql, &ctx).await.map_err(internal)?;
+        let schema_fd = flight_data_from_arrow_schema(&schema_ref).map_err(internal)?;
 
-        let out = batches
-            .map(move |res| {
-                res.map_err(internal).and_then(|rb| {
-                    let (fd, dicts) = flight_data_from_arrow_batch(&rb).map_err(internal)?;
-                    let seq = dicts.into_iter().map(Ok).chain(std::iter::once(Ok(fd)));
+        let head = futures::stream::once(async { Ok::<FlightData, Status>(schema_fd) });
+
+        // Then stream batches: dicts → main
+        use futures::{StreamExt, TryStreamExt};
+        let s = cfg.backend.query(&sql, &ctx).await.map_err(internal)?;
+        let tail = s
+            .map(|res_rb| {
+                res_rb.map_err(internal).and_then(|rb| {
+                    let (main, dicts) = flight_data_from_arrow_batch(&rb).map_err(internal)?;
+                    let seq = dicts.into_iter().map(Ok).chain(std::iter::once(Ok(main)));
                     Ok::<_, Status>(futures::stream::iter(seq))
                 })
             })
             .try_flatten();
 
-        Ok(Response::new(Box::pin(out)))
+        Ok(Response::new(Box::pin(head.chain(tail))))
     }
 
     async fn do_get_sql_info(
@@ -191,10 +204,39 @@ impl FlightSqlService for SqlRouterService {
 
     async fn do_get_fallback(
         &self,
-        _request: Request<Ticket>,
+        req: Request<Ticket>,
         message: Any,
     ) -> Result<Response<DoGetStream>, Status> {
-        Err(Status::unimplemented("do_get_fallback not implemented"))
+        let _ctx = req
+            .extensions()
+            .get::<AuthContext>()
+            .ok_or(tonic::Status::unauthenticated("no auth context"))?
+            .clone();
+
+        let raw = req.get_ref().ticket.clone();
+
+        // 1) Try TicketStatementQuery
+        if let Ok(t) = TicketStatementQuery::decode(raw.clone()) {
+            return self.do_get_statement(t, req).await;
+        }
+
+        // 2) Try other standard tickets if you plan to support them
+        if let Ok(t) = CommandPreparedStatementQuery::decode(raw.clone()) {
+            return self.do_get_prepared_statement(t, req).await;
+        }
+        // if let Ok(t) = CommandStatementSubstraitPlan::decode(raw.clone()) {
+        //     return self.do_get_substrait_plan(t, req).await;
+        // }
+
+        // 3) Last resort: maybe someone sent your old JSON ticket; try to parse and run minimal path
+        // if let Ok((tenant_id, sql)) = serde_json::from_slice::<(String, String)>(&raw) {
+        //     // (optional) call a small helper that executes the query and streams:
+        //     return self.do_get_statement_from_pair(tenant_id, sql, req).await;
+        // }
+
+        Err(tonic::Status::unimplemented(
+            "unknown ticket format; implement do_get_fallback or send a TicketStatementQuery",
+        ))
     }
 
     async fn get_flight_info_substrait_plan(
