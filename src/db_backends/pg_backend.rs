@@ -42,7 +42,7 @@ impl PostgresBackend {
         })
     }
 
-    async fn client_for(&self, ctx: &AuthContext) -> anyhow::Result<Client> {
+    async fn client_for(&self, _ctx: &AuthContext) -> anyhow::Result<Client> {
         let client = self.pool.get().await?;
         // Enforce tenancy here (choose one strategy):
         // 1) RLS guard variable:

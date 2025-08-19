@@ -55,6 +55,7 @@ mod tests {
     use testcontainers_modules::postgres;
     use testcontainers_modules::postgres::Postgres;
     use tokio_postgres::NoTls;
+    use crate::db_backends::PostgresBackend;
 
     pub struct TestInfra {
         pub router: DbRouter,
@@ -102,7 +103,7 @@ mod tests {
             ))
             .await?;
 
-        let pg = crate::db_backends::PostgresBackend::new_from_conn_string(&conn_str);
+        let pg = PostgresBackend::new_from_conn_string(&conn_str);
         let config = TenantDbConfig {
             tenant_id: tenant_id.to_string(),
             backend: Arc::new(pg),

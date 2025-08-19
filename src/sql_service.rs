@@ -43,9 +43,6 @@ type HandshakeStream =
 type DoGetStream =
     Pin<Box<dyn futures::Stream<Item = Result<arrow_flight::FlightData, tonic::Status>> + Send>>;
 
-type DoActionStream =
-    Pin<Box<dyn futures::Stream<Item = Result<arrow_flight::Result, Status>> + Send + 'static>>;
-
 #[tonic::async_trait]
 impl FlightSqlService for SqlRouterService {
     type FlightService = Self;
@@ -205,7 +202,7 @@ impl FlightSqlService for SqlRouterService {
     async fn do_get_fallback(
         &self,
         req: Request<Ticket>,
-        message: Any,
+        _message: Any,
     ) -> Result<Response<DoGetStream>, Status> {
         let _ctx = req
             .extensions()
@@ -337,7 +334,7 @@ impl FlightSqlService for SqlRouterService {
 
     async fn get_flight_info_fallback(
         &self,
-        cmd: Command,
+        _cmd: Command,
         _request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
         Err(Status::unimplemented("do_get_fallback not implemented"))
@@ -426,7 +423,7 @@ impl FlightSqlService for SqlRouterService {
     async fn do_put_fallback(
         &self,
         _request: Request<PeekableFlightDataStream>,
-        message: Any,
+        _message: Any,
     ) -> Result<Response<<Self as FlightService>::DoPutStream>, Status> {
         Err(Status::unimplemented("do_get_fallback not implemented"))
     }
@@ -434,7 +431,7 @@ impl FlightSqlService for SqlRouterService {
     async fn do_put_error_callback(
         &self,
         _request: Request<PeekableFlightDataStream>,
-        error: DoPutError,
+        _error: DoPutError,
     ) -> Result<Response<<Self as FlightService>::DoPutStream>, Status> {
         Err(Status::unimplemented("do_get_fallback not implemented"))
     }
@@ -581,7 +578,7 @@ impl FlightSqlService for SqlRouterService {
         Err(Status::unimplemented("do_get_fallback not implemented"))
     }
 
-    async fn register_sql_info(&self, id: i32, result: &SqlInfo) {
+    async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {
         // Err(Status::unimplemented("do_get_fallback not implemented"))
     }
 }

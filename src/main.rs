@@ -14,5 +14,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn build_router() -> Result<DbRouter, Box<dyn std::error::Error>> {
+    // Check e2e_handshake_query_revoke test for examples on how to build this
     Ok(DbRouter::new(vec![]))
 }
